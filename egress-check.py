@@ -30,19 +30,20 @@ Usage:
     egress-check.py socks5://user:pass@host:1080
     egress-check.py http://host:8080 --json
     egress-check.py socks5://host:1080 --samples 3 --timeout 8
+    egress-check.py socks5://host:1080 --verdicts
     egress-check.py --self-test
 
-This is stage 1 of the egress-check project (single-node mode). Stage 2
-adds AI-service verdicts (Gemini/Claude/ChatGPT/YouTube/GitHub reachability
-+ "sent to China" detection), stage 3 reads a Clash subscription YAML and
-scores every node in it, stage 4 adds streaming-unlock checks and scheduled
-re-checks with history.
+This is stage 2 of the egress-check project (single-node mode + AI-service
+verdicts). Stage 3 reads a Clash subscription YAML and scores every node
+in it, stage 4 adds streaming-unlock checks and scheduled re-checks with
+history.
 """
 
 import argparse
 import base64
 import json
 import socket
+import ssl
 import statistics
 import sys
 import time
@@ -50,7 +51,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 USER_AGENT = "egress-check/" + VERSION
 
 IP_API_URL = ("http://ip-api.com/json/"
@@ -345,12 +346,30 @@ def _proxy_auth_header(spec):
     return f"Proxy-Authorization: Basic {token}\r\n"
 
 
+def _tls_wrap(sock, host, timeout):
+    """Wrap an open tunnel socket in TLS (for https:// targets)."""
+    ctx = ssl.create_default_context()
+    try:
+        wrapped = ctx.wrap_socket(sock, server_hostname=host)
+    except Exception as e:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise ProxyError(
+            f"TLS handshake to {host} failed: {type(e).__name__}: {e}")
+    wrapped.settimeout(timeout)
+    return wrapped
+
+
 def http_fetch_via_proxy(spec, url, timeout, _connect=None):
     """GET url through the proxy. Returns a FetchResult.
 
     Plain-HTTP targets go over a CONNECT tunnel for HTTP proxies; if the
     proxy refuses CONNECT on port 80, fall back to an absolute-URI GET
-    (the classic HTTP-proxy request form).
+    (the classic HTTP-proxy request form). HTTPS targets always go over
+    a tunnel (SOCKS5 CONNECT or HTTP CONNECT) wrapped in TLS — the
+    proxy sees only the destination host, never the plaintext.
     """
     u = urlparse(url)
     host, port = u.hostname, u.port or (443 if u.scheme == "https" else 80)
@@ -364,12 +383,16 @@ def http_fetch_via_proxy(spec, url, timeout, _connect=None):
         if spec.scheme == "socks5":
             sock = socks5_connect(spec, host, port, timeout,
                                   _connect=connect)
+            if u.scheme == "https":
+                sock = _tls_wrap(sock, host, timeout)
             status, headers, body = _http_get_on_socket(
                 sock, host, path, timeout)
         else:
             try:
                 sock = http_proxy_connect(spec, host, port, timeout,
                                           _connect=connect)
+                if u.scheme == "https":
+                    sock = _tls_wrap(sock, host, timeout)
                 status, headers, body = _http_get_on_socket(
                     sock, host, path, timeout)
             except ProxyError:
@@ -484,6 +507,140 @@ def dns_probe(spec, fetch, timeout):
                         "path could not be verified"}
 
 
+# --------------------------------------------------------------------------
+# Service verdicts (stage 2)
+# --------------------------------------------------------------------------
+#
+# One small GET per service, through the same proxy. No credentials and
+# no accounts are involved: the verdicts only ask whether the exit can
+# reach the service at all, and what stands in the way when it cannot.
+# Redirects are deliberately NOT followed — a redirect target is itself
+# evidence (Google sending the exit to google.com.hk is the "sent to
+# China" signal).
+
+# (key, display name, probe URL)
+VERDICT_SERVICES = (
+    ("gemini", "Gemini API",
+     "https://generativelanguage.googleapis.com/v1beta/models"),
+    ("claude", "Claude", "https://claude.ai/"),
+    ("chatgpt", "ChatGPT", "https://chatgpt.com/"),
+    ("youtube", "YouTube", "https://www.youtube.com/"),
+    ("github", "GitHub", "https://api.github.com/"),
+    ("google", "Google", "https://www.google.com/"),
+)
+
+# Verdicts: ok | region-blocked | captcha | sent-to-china | blocked | error
+CLOUDFLARE_MARKERS = ("just a moment", "attention required",
+                      "cf-challenge", "challenges.cloudflare.com")
+REGION_MARKERS = ("not supported in your region",
+                  "location is not supported",
+                  "not available in your region",
+                  "not available in your country",
+                  "is not available in your country",
+                  "unsupported country",
+                  "not supported for the api use")
+
+
+def _body_text(res):
+    try:
+        return res.body.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _is_cloudflare_challenge(res):
+    text = _body_text(res).lower()
+    return any(m in text for m in CLOUDFLARE_MARKERS)
+
+
+def _mentions_region_block(text):
+    low = text.lower()
+    return any(m in low for m in REGION_MARKERS)
+
+
+def classify_verdict(service, res, exit_country_code=None):
+    """Classify one probe response. Returns (verdict, evidence).
+
+    res is a FetchResult. A missing/failed fetch is handled by the
+    caller (run_verdicts) as "blocked"; this function only sees real
+    HTTP responses.
+    """
+    status = res.status
+    text = _body_text(res)
+    if _is_cloudflare_challenge(res):
+        return ("captcha",
+                f"HTTP {status}, Cloudflare verification page served")
+    if service == "google":
+        loc = (res.headers.get("location") or "").lower()
+        if "google.com.hk" in loc or "google.cn" in loc:
+            return ("sent-to-china",
+                    f"google.com redirects to {loc} while the exit is "
+                    f"in {exit_country_code or 'unknown'} — Google "
+                    f"georoutes this exit to China/HK")
+        if status in (200, 301, 302, 303, 307, 308):
+            return ("ok", f"HTTP {status}"
+                    + (f", redirects to {loc}" if loc else ""))
+        return ("blocked", f"HTTP {status}")
+    if service == "gemini":
+        # No API key is sent, so 400/401/403 auth errors are the
+        # *expected* answer from a reachable Google — the egress works,
+        # the key is just missing. Only an explicit region refusal
+        # counts as region-blocked.
+        if status == 200:
+            return ("ok", "HTTP 200")
+        if status in (400, 401, 403):
+            if _mentions_region_block(text):
+                return ("region-blocked",
+                        f"HTTP {status}, Google refuses this region")
+            return ("ok",
+                    f"HTTP {status} (auth error expected without an "
+                    f"API key — the API itself is reachable)")
+        if status == 429:
+            return ("blocked", "HTTP 429 rate-limited")
+        if status >= 500:
+            return ("error", f"HTTP {status} from Google")
+        return ("blocked", f"HTTP {status}")
+    # claude / chatgpt / youtube / github
+    if status in (200, 301, 302, 303, 307, 308):
+        return ("ok", f"HTTP {status}")
+    if status == 403:
+        if _mentions_region_block(text):
+            return ("region-blocked",
+                    f"HTTP {status}, service refuses this region")
+        if "abuse" in text.lower():
+            return ("blocked",
+                    "HTTP 403 abuse / rate-limit detection")
+        return ("blocked", f"HTTP {status} forbidden")
+    if status == 429:
+        return ("blocked", "HTTP 429 rate-limited")
+    if status >= 500:
+        return ("error", f"HTTP {status} from the service")
+    return ("blocked", f"HTTP {status}")
+
+
+def run_verdicts(spec, fetch, timeout, exit_country_code=None):
+    """Probe every VERDICT_SERVICES URL through the proxy.
+
+    Returns {key: {"service", "url", "verdict", "evidence", "status"}}.
+    A fetch that raises (timeout, DNS, TLS, proxy refusal) is
+    "blocked" — the exit could not reach the service at all.
+    """
+    out = {}
+    for key, label, url in VERDICT_SERVICES:
+        try:
+            res = fetch(spec, url, timeout)
+        except Exception as e:
+            out[key] = {"service": label, "url": url,
+                        "verdict": "blocked",
+                        "evidence": f"{type(e).__name__}: {e}",
+                        "status": None}
+            continue
+        verdict, evidence = classify_verdict(key, res, exit_country_code)
+        out[key] = {"service": label, "url": url, "verdict": verdict,
+                    "evidence": evidence, "status": res.status}
+    return out
+
+
 def latency_points(median_ms):
     """Latency sub-score (20 max) from the median sample."""
     if median_ms is None:
@@ -521,8 +678,14 @@ def score_result(alive, median_ms, anonymity, dns_mode):
     return pts, grade
 
 
-def run_check(spec, timeout=10.0, samples=5, fetch=None, direct_fetch=None):
-    """Run the full checkup. Returns a JSON-able result dict."""
+def run_check(spec, timeout=10.0, samples=5, fetch=None, direct_fetch=None,
+              verdicts=False):
+    """Run the full checkup. Returns a JSON-able result dict.
+
+    verdicts=True additionally probes the AI services (stage 2) once
+    the proxy is known alive; the verdicts are reported as-is and do
+    not change the 0-100 score.
+    """
     fetch = fetch or http_fetch_via_proxy
     direct_fetch = direct_fetch or http_get_direct
     result = {"proxy": spec.display, "scheme": spec.scheme,
@@ -531,6 +694,7 @@ def run_check(spec, timeout=10.0, samples=5, fetch=None, direct_fetch=None):
               "org": None, "asn": None, "latency_ms": None,
               "anonymity": "unknown", "anonymity_evidence": [],
               "dns": {"mode": "unknown", "evidence": "not run"},
+              "verdicts": None,
               "direct_ip": None, "score": 0, "grade": "F",
               "error": None}
 
@@ -592,6 +756,10 @@ def run_check(spec, timeout=10.0, samples=5, fetch=None, direct_fetch=None):
 
     result["dns"] = dns_probe(spec, fetch, timeout)
 
+    if verdicts:
+        result["verdicts"] = run_verdicts(
+            spec, fetch, timeout, result.get("country_code"))
+
     result["score"], result["grade"] = score_result(
         True, median_ms, anon, result["dns"]["mode"])
     return result
@@ -632,6 +800,12 @@ def render_table(result):
     lines.append(row("DNS",
                      result["dns"]["mode"] + " — " +
                      result["dns"]["evidence"]))
+    if result.get("verdicts"):
+        lines.append("verdicts")
+        for key, _label, _url in VERDICT_SERVICES:
+            v = result["verdicts"][key]
+            lines.append(f"  {v['service']:<11} {v['verdict']} — "
+                         f"{v['evidence']}")
     lines.append(row("score",
                      f"{result['score']}/100 ({result['grade']})"))
     return "\n".join(lines)
@@ -679,6 +853,24 @@ def _stub_fetch_factory():
             return FetchResult(200, {}, body, 90.0)
         if "example.com" in url:
             return FetchResult(200, {}, b"<!doctype html>", 100.0)
+        if "generativelanguage.googleapis.com" in url:
+            body = json.dumps({"error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid "
+                           "API key."}}).encode()
+            return FetchResult(400, {}, body, 80.0)
+        if "claude.ai" in url:
+            return FetchResult(200, {}, b"<html>Claude</html>", 110.0)
+        if "chatgpt.com" in url:
+            return FetchResult(200, {}, b"<html>ChatGPT</html>", 100.0)
+        if "youtube.com" in url:
+            return FetchResult(200, {}, b"<html>YouTube</html>", 130.0)
+        if "api.github.com" in url:
+            body = json.dumps(
+                {"current_user_url": "https://api.github.com/user"}).encode()
+            return FetchResult(200, {}, body, 90.0)
+        if "google.com" in url:
+            return FetchResult(200, {}, b"<html>Google</html>", 95.0)
         raise ProxyError(f"stub: unexpected URL {url}")
     return fetch
 
@@ -838,6 +1030,84 @@ def self_test():
         assert res["alive"] is False and res["score"] == 0
         assert "no" in render_table(res)
 
+    @check("verdicts: classify gemini / google / captcha / region-blocked")
+    def _():
+        v, _ = classify_verdict(
+            "gemini", FetchResult(400, {}, json.dumps(
+                {"error": {"message": "API key not valid"}}).encode(), 10.0))
+        assert v == "ok"  # auth error, no key: API itself reachable
+        v, _ = classify_verdict(
+            "gemini", FetchResult(400, {}, json.dumps(
+                {"error": {"message": "User location is not supported "
+                                      "for the API use"}}).encode(), 10.0))
+        assert v == "region-blocked"
+        v, ev = classify_verdict(
+            "google",
+            FetchResult(302, {"location": "https://www.google.com.hk/"},
+                        b"", 10.0), "US")
+        assert v == "sent-to-china" and "US" in ev
+        v, _ = classify_verdict(
+            "google", FetchResult(200, {}, b"ok", 10.0), "US")
+        assert v == "ok"
+        v, _ = classify_verdict(
+            "chatgpt",
+            FetchResult(403, {}, b"<title>Just a moment...</title>", 10.0))
+        assert v == "captcha"
+        v, _ = classify_verdict(
+            "youtube", FetchResult(403, {}, b"Forbidden", 10.0))
+        assert v == "blocked"
+        v, _ = classify_verdict(
+            "claude", FetchResult(200, {}, b"ok", 10.0))
+        assert v == "ok"
+
+    @check("verdicts: run_verdicts via stub covers all six services")
+    def _():
+        spec = parse_proxy_url("socks5://127.0.0.1:1080")
+        out = run_verdicts(spec, _stub_fetch_factory(), 5, "US")
+        assert set(out) == {"gemini", "claude", "chatgpt",
+                            "youtube", "github", "google"}
+        assert out["gemini"]["verdict"] == "ok"
+        assert out["claude"]["verdict"] == "ok"
+        assert out["github"]["verdict"] == "ok"
+        assert out["google"]["verdict"] == "ok"
+        assert all(v["status"] is not None for v in out.values())
+
+    @check("verdicts: fetch failure is blocked, not a crash")
+    def _():
+        def boom(spec, url, timeout):
+            raise ProxyError("stub: timeout")
+        out = run_verdicts(parse_proxy_url("socks5://127.0.0.1:1080"),
+                           boom, 5, "US")
+        assert all(v["verdict"] == "blocked" for v in out.values())
+
+    @check("run_check: verdicts=True adds verdicts and renders them")
+    def _():
+        spec = parse_proxy_url("socks5://127.0.0.1:1080")
+        res = run_check(spec, timeout=5, samples=1,
+                        fetch=_stub_fetch_factory(),
+                        direct_fetch=_stub_direct, verdicts=True)
+        assert res["verdicts"] is not None
+        assert res["verdicts"]["gemini"]["verdict"] == "ok"
+        table = render_table(res)
+        assert "verdicts" in table and "Gemini API" in table
+        assert json.loads(json.dumps(res))["verdicts"]["google"][
+            "verdict"] == "ok"
+
+    @check("https: TLS wrap failure surfaces as ProxyError")
+    def _():
+        # A fake socket is not a real socket, so the TLS handshake
+        # cannot run; the failure must still come back as ProxyError,
+        # never a raw ssl/socket error.
+        spec = parse_proxy_url("socks5://127.0.0.1:1080")
+        fake = _FakeSocket(bytes([5, 0]) +
+                           bytes([5, 0, 0, 1, 203, 0, 113, 1, 0, 80]))
+        try:
+            http_fetch_via_proxy(spec, "https://example.com/", 5,
+                                 _connect=lambda a, timeout: fake)
+        except ProxyError:
+            return
+        raise AssertionError("expected ProxyError from failed TLS wrap")
+
     @check("run_check: credentials never appear in output")
     def _():
         spec = parse_proxy_url("socks5://secretuser:secretpass@127.0.0.1:1080")
@@ -875,6 +1145,11 @@ def main(argv=None):
                         help="per-request timeout in seconds (default 10)")
     parser.add_argument("--samples", type=int, default=5,
                         help="latency samples to take (default 5)")
+    parser.add_argument("--verdicts", action="store_true",
+                        help="also probe AI services (Gemini, Claude, "
+                             "ChatGPT, YouTube, GitHub, Google) and report "
+                             "reachability verdicts incl. sent-to-China "
+                             "detection")
     parser.add_argument("--json", action="store_true",
                         help="print the result as JSON instead of a table")
     parser.add_argument("--self-test", action="store_true",
@@ -898,7 +1173,8 @@ def main(argv=None):
         print(f"egress-check: {e}", file=sys.stderr)
         return 2
 
-    result = run_check(spec, timeout=args.timeout, samples=args.samples)
+    result = run_check(spec, timeout=args.timeout, samples=args.samples,
+                       verdicts=args.verdicts)
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:

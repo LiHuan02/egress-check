@@ -2,10 +2,13 @@
 
 A single-file, zero-dependency CLI that scores one proxy's **egress
 quality**: is this node alive, where does traffic actually come out, does
-it leak your real IP, how slow is it, and does DNS leak?
+it leak your real IP, how slow is it, does DNS leak — and, with
+`--verdicts`, can the exit actually reach the AI services you care
+about (Gemini, Claude, ChatGPT, YouTube, GitHub, Google), or is it
+geo-routed to China?
 
 ```text
-$ python3 egress-check.py socks5://user:pass@host:1080
+$ python3 egress-check.py socks5://user:pass@host:1080 --verdicts
 egress-check  socks5://host:1080
 alive        yes
 exit IP      203.0.113.7
@@ -15,6 +18,13 @@ ISP          Example ISP
 latency      median 120 ms (min 98, max 210; 5 samples)
 anonymity    elite — no proxy-identifying headers seen
 DNS          remote — proxy was given only the hostname, so the lookup happened on the proxy side
+verdicts
+  Gemini API  ok — HTTP 400 (auth error expected without an API key — the API itself is reachable)
+  Claude      ok — HTTP 200
+  ChatGPT     ok — HTTP 200
+  YouTube     ok — HTTP 200
+  GitHub      ok — HTTP 200
+  Google      ok — HTTP 200
 score        100/100 (A)
 ```
 
@@ -45,6 +55,7 @@ one checks the nodes are up, this one checks what the exit looks like.
 python3 egress-check.py socks5://user:pass@host:1080
 python3 egress-check.py http://host:8080 --json
 python3 egress-check.py socks5://host:1080 --samples 3 --timeout 8
+python3 egress-check.py socks5://host:1080 --verdicts
 python3 egress-check.py --self-test
 ```
 
@@ -54,6 +65,9 @@ python3 egress-check.py --self-test
 * `--samples` sets how many requests the latency median is taken over
   (default 5). `--timeout` sets the per-request timeout in seconds
   (default 10).
+* `--verdicts` additionally probes six services through the proxy and
+  reports one verdict per service (see below). Off by default, so a
+  plain run stays fast.
 * `--json` prints the full result as machine-readable JSON instead of
   the table.
 
@@ -77,6 +91,26 @@ python3 egress-check.py --self-test
   so the lookup happens on the proxy side by construction. As extra
   evidence the local resolver is tried first: if it fails while the
   proxy fetch succeeds, remote resolution is proven, not just assumed.
+* **Service verdicts** (`--verdicts`) — one small GET per service
+  through the same proxy, over a TLS-wrapped tunnel (the proxy sees
+  only the destination host, never the plaintext). No accounts, keys
+  or logins are involved; each probe just asks whether the exit can
+  reach the service. Redirects are deliberately *not* followed — the
+  redirect target is itself evidence. Verdicts:
+  * `ok` — the service answered (for the Gemini API, a 400/401/403
+    auth error *is* the expected answer without an API key: the API
+    is reachable, the key is just missing).
+  * `region-blocked` — the service answered but refuses this region
+    ("not supported in your region", "location is not supported").
+  * `captcha` — a Cloudflare verification page ("Just a moment",
+    "Attention Required") was served instead of the service.
+  * `sent-to-china` — Google only: `google.com` redirects the exit
+    to `google.com.hk` / `google.cn` while the exit IP is elsewhere,
+    i.e. Google georoutes this exit to China/HK.
+  * `blocked` — no answer at all (timeout, DNS/TLS failure, proxy
+    refusal) or a plain 403/429.
+  * `error` — the service answered with a 5xx.
+  Verdicts are reported as-is and do **not** change the 0–100 score.
 
 ## Scoring
 
@@ -97,12 +131,16 @@ because the standard library has no SOCKS client.
 
 ## Self-test
 
-`--self-test` runs fully offline (12 checks): proxy-URL parsing, exact
+`--self-test` runs fully offline (17 checks): proxy-URL parsing, exact
 SOCKS5 handshake bytes (no-auth and user/pass), refused-CONNECT errors,
 HTTP response parsing (Content-Length and chunked), the HTTP-proxy
 CONNECT tunnel plus absolute-URI fallback, anonymity grading,
 scoring boundaries, a stubbed end-to-end run (scores 100/A), a dead
-proxy (scores 0), and a check that credentials never appear in output.
+proxy (scores 0), a check that credentials never appear in output,
+verdict classification (Gemini auth error vs region refusal, Google
+redirect to `.hk` vs plain 200, Cloudflare challenge pages), a stubbed
+verdicts run covering all six services, a fetch failure degrading to
+`blocked`, and a TLS-wrap failure surfacing as `ProxyError`.
 
 ## Related work and roadmap
 
@@ -115,20 +153,21 @@ of those do in one place, is a scorecard driven by a Clash subscription
 file, with AI-service verdicts (Gemini / Claude / ChatGPT / YouTube /
 GitHub reachability plus "sent to China" detection) at its core.
 
-Roadmap: stage 1 (this release) — single-node mode. Stage 2 — AI
+Roadmap: stage 1 — single-node mode. Stage 2 (this release) — AI
 service verdicts. Stage 3 — subscription mode: read a Clash YAML and
 score every node in it. Stage 4 — streaming unlocks, scheduled
 re-checks, history.
 
 ## Limitations
 
-* Stage 1 checks plain-HTTP endpoints only; HTTPS-target checks (needed
-  for some service verdicts) arrive with stage 2.
 * Geo/ASN data comes from ip-api.com (free tier, no key); if it is
-  unreachable, the check reports the proxy dead even though the proxy
-  itself may be fine — the error message says which endpoint failed.
+unreachable, the check reports the proxy dead even though the proxy
+itself may be fine — the error message says which endpoint failed.
 * Latency includes the full request round-trip through the proxy, not
   just TCP connect time.
+* Verdicts are a single GET each: a service that is slow or flaky can
+  show `blocked` on one run and `ok` on the next — re-run before
+  concluding a node is unusable for that service.
 
 ## License
 
